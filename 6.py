@@ -1,401 +1,560 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-Скрипт 6: Сборка ELF из ASM (без NASM и ld)
+Лексер для NASM-ассемблера (Intel синтаксис)
+ИСПРАВЛЕННАЯ ВЕРСИЯ:
+- Правильно различает глобальные и локальные метки (с точкой)
+- Корректно обрабатывает секции .text и .data
+- Поддерживает кириллицу в идентификаторах
+- Без использования re, только ручной разбор
 """
 
 import sys
-import struct
-import os
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional
 
 # ============================================================
-# Конфигурация ELF
+# Типы токенов
 # ============================================================
 
-PAGE_SIZE = 0x1000
-TEXT_VADDR = 0x401000
+TOKEN_TYPES = {
+    'WORD': 'WORD',           # инструкция, регистр, число, директива
+    'NUMBER': 'NUMBER',       # 123, 0x7F
+    'STRING': 'STRING',       # "hello\n"
+    'CHAR': 'CHAR',           # 'a', '\n'
+    'COLON': 'COLON',         # :
+    'COMMA': 'COMMA',         # ,
+    'LBRACKET': 'LBRACKET',   # [
+    'RBRACKET': 'RBRACKET',   # ]
+    'PLUS': 'PLUS',           # +
+    'MINUS': 'MINUS',         # -
+    'SEMICOLON': 'SEMICOLON', # ;
+    'DIRECTIVE': 'DIRECTIVE', # .text, .data, .global, .string (начинаются с точки)
+    'LOCAL_LABEL': 'LOCAL_LABEL',  # .return_печать, .while_start (локальные метки)
+    'LABEL': 'LABEL',         # метка_имя: (глобальные метки)
+    'REGISTER': 'REGISTER',   # rax, rbx, eax, al, ah, ...
+    'INSTRUCTION': 'INSTRUCTION', # mov, add, call, ...
+    'SECTION': 'SECTION',     # section (ключевое слово)
+    'EOF': 'EOF'
+}
 
 # ============================================================
-# Парсинг ASM
+# Таблица регистров x86-64 (английские и русские имена)
 # ============================================================
 
-class AsmParser:
-    def __init__(self):
-        self.sections = {
-            '.text': bytearray(),
-            '.data': bytearray(),
-            '.bss': {}
-        }
-        self.current_section = '.text'
-        self.labels = {}
-        self.label_section = {}
-        self.entry_point = '_start'
-        self.position = {'.text': 0, '.data': 0}
-        self.pass_num = 1
-        self.text_vaddr = TEXT_VADDR
-        
-        self.registers = {
-            'rax': 0, 'rcx': 1, 'rdx': 2, 'rbx': 3,
-            'rsp': 4, 'rbp': 5, 'rsi': 6, 'rdi': 7,
-            'r8': 8, 'r9': 9, 'r10': 10, 'r11': 11,
-            'r12': 12, 'r13': 13, 'r14': 14, 'r15': 15,
-        }
+REGISTERS = {
+    # 64-битные (английские)
+    'rax': 0, 'rbx': 1, 'rcx': 2, 'rdx': 3,
+    'rsi': 4, 'rdi': 5, 'rsp': 6, 'rbp': 7,
+    'r8': 8, 'r9': 9, 'r10': 10, 'r11': 11,
+    'r12': 12, 'r13': 13, 'r14': 14, 'r15': 15,
     
-    def parse_number(self, s: str) -> int:
-        s = s.strip()
-        if s.startswith('0x') or s.startswith('0X'):
-            return int(s[2:], 16)
-        return int(s)
+    # 64-битные (русские транслитерация)
+    'раикс': 0, 'рбикс': 1, 'рсикс': 2, 'рдикс': 3,
+    'рсиай': 4, 'рдиай': 5, 'рсипи': 6, 'рбипи': 7,
+    'р8': 8, 'р9': 9, 'р10': 10, 'р11': 11,
+    'р12': 12, 'р13': 13, 'р14': 14, 'р15': 15,
     
-    def parse_operand(self, op: str, text_addr: int = 0):
-        op = op.strip()
-        
-        if op in self.registers:
-            return ('reg', self.registers[op], None)
-        
-        if op.startswith('[') and op.endswith(']'):
-            inner = op[1:-1].strip()
-            if inner in self.registers:
-                return ('mem_reg', self.registers[inner], None)
-            return ('mem_label', inner, None)
-        
+    # 32-битные (английские)
+    'eax': 0, 'ebx': 1, 'ecx': 2, 'edx': 3,
+    'esi': 4, 'edi': 5, 'esp': 6, 'ebp': 7,
+    'r8d': 8, 'r9d': 9, 'r10d': 10, 'r11d': 11,
+    'r12d': 12, 'r13d': 13, 'r14d': 14, 'r15d': 15,
+    
+    # 32-битные (русские)
+    'еаикс': 0, 'ебикс': 1, 'есикс': 2, 'едикс': 3,
+    'есиай': 4, 'едиай': 5, 'есипи': 6, 'ебипи': 7,
+    'р8д': 8, 'р9д': 9, 'р10д': 10, 'р11д': 11,
+    'р12д': 12, 'р13д': 13, 'р14д': 14, 'р15д': 15,
+    
+    # 16-битные (английские)
+    'ax': 0, 'bx': 1, 'cx': 2, 'dx': 3,
+    'si': 4, 'di': 5, 'sp': 6, 'bp': 7,
+    'r8w': 8, 'r9w': 9, 'r10w': 10, 'r11w': 11,
+    'r12w': 12, 'r13w': 13, 'r14w': 14, 'r15w': 15,
+    
+    # 16-битные (русские)
+    'аикс': 0, 'бикс': 1, 'сикс': 2, 'дикс': 3,
+    'эс': 4, 'ди': 5, 'эсп': 6, 'бипи': 7,
+    'р8в': 8, 'р9в': 9, 'р10в': 10, 'р11в': 11,
+    'р12в': 12, 'р13в': 13, 'р14в': 14, 'р15в': 15,
+    
+    # 8-битные (младшие) (английские)
+    'al': 0, 'bl': 1, 'cl': 2, 'dl': 3,
+    'sil': 4, 'dil': 5, 'spl': 6, 'bpl': 7,
+    'r8b': 8, 'r9b': 9, 'r10b': 10, 'r11b': 11,
+    'r12b': 12, 'r13b': 13, 'r14b': 14, 'r15b': 15,
+    
+    # 8-битные (младшие) (русские)
+    'ал': 0, 'бл': 1, 'кл': 2, 'дл': 3,
+    'сил': 4, 'дил': 5, 'спл': 6, 'бпл': 7,
+    'р8б': 8, 'р9б': 9, 'р10б': 10, 'р11б': 11,
+    'р12б': 12, 'р13б': 13, 'р14б': 14, 'р15б': 15,
+    
+    # 8-битные (старшие) - только для первых 4 регистров (английские)
+    'ah': 0, 'bh': 1, 'ch': 2, 'dh': 3,
+    
+    # 8-битные (старшие) (русские)
+    'аш': 0, 'бш': 1, 'чш': 2, 'дш': 3,
+}
+
+# ============================================================
+# Таблица инструкций x86-64
+# ============================================================
+
+INSTRUCTIONS = {
+    # Пересылка данных
+    'mov', 'lea', 'movzx', 'movsx', 'xchg',
+    # Арифметика
+    'add', 'sub', 'imul', 'idiv', 'inc', 'dec', 'neg', 'mul', 'div',
+    # Логика
+    'and', 'or', 'xor', 'not',
+    # Сравнение
+    'cmp', 'test',
+    # Переходы
+    'jmp', 'je', 'jne', 'jl', 'jle', 'jg', 'jge', 'jz', 'jnz',
+    'jc', 'jnc', 'jo', 'jno', 'js', 'jns',
+    # Стек
+    'push', 'pop',
+    # Вызовы
+    'call', 'ret',
+    # Системные
+    'syscall', 'int',
+    # Сдвиги
+    'shl', 'shr', 'sar', 'sal', 'rol', 'ror',
+    # Циклы
+    'loop',
+    # Прочие
+    'nop', 'hlt', 'leave', 'cqo'
+}
+
+# ============================================================
+# Ключевые слова
+# ============================================================
+
+KEYWORDS = {
+    'section', 'global', 'extern'
+}
+
+# ============================================================
+# Вспомогательные функции
+# ============================================================
+
+class Token:
+    """Структура токена"""
+    def __init__(self, type_, value, line, col):
+        self.type = type_
+        self.value = value
+        self.line = line
+        self.col = col
+    
+    def __repr__(self):
+        value_disp = self.value.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+        return f"Token({self.type}, '{value_disp}', line={self.line}, col={self.col})"
+
+
+def is_whitespace(ch):
+    """Проверка на пробельный символ"""
+    return ch in ' \t\n\r\x0b\x0c'
+
+
+def is_digit(ch):
+    """Проверка на цифру"""
+    return '0' <= ch <= '9'
+
+
+def is_hex_digit(ch):
+    """Проверка на шестнадцатеричную цифру"""
+    return is_digit(ch) or ('a' <= ch <= 'f') or ('A' <= ch <= 'F')
+
+
+def is_alpha(ch):
+    """
+    Проверка на букву (поддерживает латиницу и кириллицу)
+    """
+    # ASCII латиница и подчёркивание
+    if ('a' <= ch <= 'z') or ('A' <= ch <= 'Z') or ch == '_':
+        return True
+    
+    # Кириллица (поддержка русского языка)
+    code = ord(ch)
+    
+    # Русские буквы: А-Я, а-я
+    if (0x0410 <= code <= 0x042F) or (0x0430 <= code <= 0x044F):
+        return True
+    
+    # Ё (0x0401) и ё (0x0451)
+    if code == 0x0401 or code == 0x0451:
+        return True
+    
+    return False
+
+
+def is_alpha_or_digit(ch):
+    """Буква или цифра"""
+    return is_alpha(ch) or is_digit(ch)
+
+
+def read_number(source, pos, line, col):
+    """Читает число (десятичное или hex)"""
+    start = pos
+    value_str = ''
+    
+    # Проверка на 0x или 0X
+    if source[pos] == '0' and pos + 1 < len(source) and source[pos + 1] in 'xX':
+        value_str = source[pos:pos+2]
+        pos += 2
+        while pos < len(source) and is_hex_digit(source[pos]):
+            value_str += source[pos]
+            pos += 1
         try:
-            val = self.parse_number(op)
-            return ('imm', val, None)
-        except:
-            pass
-        
-        if op in self.labels or self.pass_num == 1:
-            return ('label', op, None)
-        
-        raise ValueError(f"Неизвестный операнд: {op}")
+            int(value_str, 16)
+        except ValueError:
+            raise ValueError(f"Некорректное hex число: {value_str}")
+    else:
+        # Десятичное число
+        while pos < len(source) and is_digit(source[pos]):
+            value_str += source[pos]
+            pos += 1
     
-    def encode_instruction(self, mnemonic: str, operands: List[str], text_addr: int) -> bytearray:
-        # MOV reg, reg
-        if mnemonic == 'mov' and len(operands) == 2:
-            op1 = self.parse_operand(operands[0], text_addr)
-            op2 = self.parse_operand(operands[1], text_addr)
-            
-            if op1[0] == 'reg' and op2[0] == 'reg':
-                dst, src = op1[1], op2[1]
-                rex = 0x48
-                if src >= 8: rex |= 0x04
-                if dst >= 8: rex |= 0x01
-                return bytearray([rex, 0x89, 0xC0 | ((src & 7) << 3) | (dst & 7)])
-            
-            if op1[0] == 'reg' and op2[0] == 'imm':
-                reg, imm = op1[1], op2[1]
-                if reg >= 8:
-                    return bytearray([0x49, 0xB8 + (reg - 8)]) + struct.pack('<Q', imm)
-                else:
-                    return bytearray([0x48, 0xB8 + reg]) + struct.pack('<Q', imm)
-        
-        # CALL
-        if mnemonic == 'call' and len(operands) == 1:
-            op = self.parse_operand(operands[0], text_addr)
-            if self.pass_num == 1:
-                return bytearray([0xE8, 0, 0, 0, 0])
-            addr = self.labels.get(op[1], 0)
-            target = self.text_vaddr + addr
-            disp = target - (text_addr + 5)
-            return bytearray([0xE8]) + struct.pack('<i', disp)
-        
-        # JMP
-        if mnemonic == 'jmp' and len(operands) == 1:
-            op = self.parse_operand(operands[0], text_addr)
-            if op[0] == 'label':
-                if self.pass_num == 1:
-                    return bytearray([0xE9, 0, 0, 0, 0])
-                addr = self.labels.get(op[1], 0)
-                target = self.text_vaddr + addr
-                disp = target - (text_addr + 5)
-                return bytearray([0xE9]) + struct.pack('<i', disp)
-        
-        # SYSCALL
-        if mnemonic == 'syscall':
-            return bytearray([0x0F, 0x05])
-        
-        # RET
-        if mnemonic == 'ret':
-            return bytearray([0xC3])
-        
-        # PUSH
-        if mnemonic == 'push' and len(operands) == 1:
-            op = self.parse_operand(operands[0], text_addr)
-            if op[0] == 'reg':
-                reg = op[1]
-                if reg >= 8:
-                    return bytearray([0x41, 0x50 + (reg - 8)])
-                return bytearray([0x50 + reg])
-        
-        # POP
-        if mnemonic == 'pop' and len(operands) == 1:
-            op = self.parse_operand(operands[0], text_addr)
-            if op[0] == 'reg':
-                reg = op[1]
-                if reg >= 8:
-                    return bytearray([0x41, 0x58 + (reg - 8)])
-                return bytearray([0x58 + reg])
-        
-        # ADD/SUB
-        if mnemonic in ('add', 'sub') and len(operands) == 2:
-            op1 = self.parse_operand(operands[0], text_addr)
-            op2 = self.parse_operand(operands[1], text_addr)
-            if op1[0] == 'reg' and op2[0] == 'imm':
-                reg, imm = op1[1], op2[1]
-                is_add = (mnemonic == 'add')
-                if -128 <= imm <= 127:
-                    base = 0x83
-                    subop = 0xC0 if is_add else 0xE8
-                    if reg >= 8:
-                        return bytearray([0x49, base, subop | (reg & 7), imm & 0xFF])
-                    else:
-                        return bytearray([0x48, base, subop | (reg & 7), imm & 0xFF])
-                else:
-                    base = 0x81
-                    subop = 0xC0 if is_add else 0xE8
-                    if reg >= 8:
-                        return bytearray([0x49, base, subop | (reg & 7)]) + struct.pack('<i', imm)
-                    else:
-                        return bytearray([0x48, base, subop | (reg & 7)]) + struct.pack('<i', imm)
-        
-        # SUB reg, reg
-        if mnemonic == 'sub' and len(operands) == 2:
-            op1 = self.parse_operand(operands[0], text_addr)
-            op2 = self.parse_operand(operands[1], text_addr)
-            if op1[0] == 'reg' and op2[0] == 'reg':
-                dst, src = op1[1], op2[1]
-                rex = 0x48
-                if src >= 8: rex |= 0x04
-                if dst >= 8: rex |= 0x01
-                return bytearray([rex, 0x29, 0xC0 | ((src & 7) << 3) | (dst & 7)])
-        
-        # LEAVE
-        if mnemonic == 'leave':
-            return bytearray([0xC9])
-        
-        # NOP
-        if mnemonic == 'nop':
-            return bytearray([0x90])
-        
-        raise ValueError(f"Неподдерживаемая инструкция: {mnemonic} {operands}")
+    return Token(TOKEN_TYPES['NUMBER'], value_str, line, col), pos
+
+
+def read_string(source, pos, line, col):
+    """Читает строку в двойных кавычках"""
+    pos += 1
+    value = ''
     
-    def parse_line(self, line: str, line_num: int):
-        line = line.strip()
-        if not line:
-            return
-        
-        if ';' in line:
-            line = line[:line.index(';')].strip()
-            if not line:
-                return
-        
-        if line.startswith('section '):
-            parts = line.split()
-            if len(parts) >= 2:
-                self.current_section = parts[1]
-            return
-        
-        if line.startswith('global '):
-            parts = line.split()
-            if len(parts) >= 2:
-                self.entry_point = parts[1]
-            return
-        
-        if line.startswith('default '):
-            return
-        
-        if line.startswith('.text') or line.startswith('.data'):
-            return
-        
-        # Метки (включая .return_main)
-        if ':' in line:
-            # Пропускаем директивы
-            if not line.startswith(('.global', '.section', '.text', '.data', '.bss', '.default')):
-                label = line.split(':')[0].strip()
-                if label not in ('', '.text', '.data', '.bss'):
-                    self.labels[label] = self.position[self.current_section]
-                    self.label_section[label] = self.current_section
-                    rest = line.split(':', 1)[1].strip()
-                    if rest:
-                        self.parse_line(rest, line_num)
-                    return
-        
-        if line.startswith('resq '):
-            parts = line.split()
-            if len(parts) >= 2:
-                count = self.parse_number(parts[1])
-                size = count * 8
-                if self.pass_num == 2:
-                    self.position[self.current_section] += size
-            return
-        
-        # Инструкция
-        parts = line.split(maxsplit=1)
-        mnemonic = parts[0]
-        operands = []
-        if len(parts) > 1:
-            op_str = parts[1]
-            depth = 0
-            current_op = []
-            for ch in op_str:
-                if ch == ',' and depth == 0:
-                    operands.append(''.join(current_op).strip())
-                    current_op = []
-                else:
-                    if ch == '[': depth += 1
-                    elif ch == ']': depth -= 1
-                    current_op.append(ch)
-            if current_op:
-                operands.append(''.join(current_op).strip())
-        
-        if self.pass_num == 1:
-            try:
-                code = self.encode_instruction(mnemonic, operands, 0)
-                self.position[self.current_section] += len(code)
-            except ValueError:
-                if mnemonic in ('call', 'jmp'):
-                    self.position[self.current_section] += 5
-                else:
-                    raise
+    while pos < len(source):
+        ch = source[pos]
+        if ch == '"':
+            pos += 1
+            break
+        elif ch == '\\':
+            pos += 1
+            if pos >= len(source):
+                raise ValueError(f"Незавершённая escape-последовательность в строке")
+            esc = source[pos]
+            if esc == 'n':
+                value += '\n'
+            elif esc == 't':
+                value += '\t'
+            elif esc == 'r':
+                value += '\r'
+            elif esc == '"':
+                value += '"'
+            elif esc == '\\':
+                value += '\\'
+            elif esc == '0':
+                value += '\0'
+            else:
+                value += '\\' + esc
+            pos += 1
         else:
-            text_addr = self.text_vaddr + self.position['.text']
-            code = self.encode_instruction(mnemonic, operands, text_addr)
-            self.sections[self.current_section].extend(code)
-            self.position[self.current_section] += len(code)
+            value += ch
+            pos += 1
+    else:
+        raise ValueError(f"Незакрытая строка на строке {line}")
     
-    def assemble(self, asm_code: str):
-        lines = asm_code.split('\n')
+    return Token(TOKEN_TYPES['STRING'], value, line, col), pos
+
+
+def read_char(source, pos, line, col):
+    """Читает символ в одинарных кавычках"""
+    pos += 1
+    value = ''
+    
+    if pos >= len(source):
+        raise ValueError(f"Незакрытый символ на строке {line}")
+    
+    ch = source[pos]
+    if ch == '\\':
+        pos += 1
+        if pos >= len(source):
+            raise ValueError(f"Незавершённая escape-последовательность")
+        esc = source[pos]
+        if esc == 'n':
+            value = '\n'
+        elif esc == 't':
+            value = '\t'
+        elif esc == 'r':
+            value = '\r'
+        elif esc == '0':
+            value = '\0'
+        elif esc == '\\':
+            value = '\\'
+        elif esc == "'":
+            value = "'"
+        else:
+            value = '\\' + esc
+        pos += 1
+    else:
+        value = ch
+        pos += 1
+    
+    if pos >= len(source) or source[pos] != "'":
+        raise ValueError(f"Ожидалась закрывающая кавычка на строке {line}")
+    pos += 1
+    
+    return Token(TOKEN_TYPES['CHAR'], value, line, col), pos
+
+
+def classify_word(word, line, col):
+    """
+    Классифицирует слово (идентификатор) в зависимости от контекста
+    Возвращает (token_type, token_value)
+    """
+    # Директивы (начинаются с точки)
+    if word.startswith('.'):
+        # Локальные метки (точка + буквы/цифры, и не являются стандартными директивами)
+        # Стандартные директивы NASM
+        standard_directives = {
+            '.text', '.data', '.bss', '.rodata',
+            '.global', '.globl', '.extern', '.section',
+            '.string', '.asciz', '.byte', '.word', '.long', '.quad',
+            '.align', '.zero', '.ascii'
+        }
         
-        # Проход 1
-        self.pass_num = 1
-        self.position['.text'] = 0
-        self.position['.data'] = 0
-        self.labels.clear()
+        if word in standard_directives:
+            return TOKEN_TYPES['DIRECTIVE'], word
+        else:
+            # Всё остальное с точкой — локальная метка
+            return TOKEN_TYPES['LOCAL_LABEL'], word
+    
+    # Ключевые слова (section, global и т.д.)
+    if word in KEYWORDS:
+        return TOKEN_TYPES['WORD'], word
+    
+    # Регистры
+    if word in REGISTERS:
+        return TOKEN_TYPES['REGISTER'], word
+    
+    # Инструкции
+    if word in INSTRUCTIONS:
+        return TOKEN_TYPES['INSTRUCTION'], word
+    
+    # Обычное слово (может быть глобальной меткой или идентификатором)
+    return TOKEN_TYPES['WORD'], word
+
+
+def read_word(source, pos, line, col):
+    """
+    Читает слово (идентификатор) и классифицирует его
+    """
+    start = pos
+    word = ''
+    
+    while pos < len(source):
+        ch = source[pos]
+        if is_alpha_or_digit(ch) or ch == '.':
+            word += ch
+            pos += 1
+        else:
+            break
+    
+    token_type, token_value = classify_word(word, line, col)
+    return Token(token_type, token_value, line, col), pos
+
+
+def tokenize_line(line, line_num):
+    """Токенизирует одну строку"""
+    tokens = []
+    pos = 0
+    length = len(line)
+    
+    while pos < length:
+        ch = line[pos]
         
-        for i, line in enumerate(lines, 1):
-            try:
-                self.parse_line(line, i)
-            except Exception as e:
-                print(f"Ошибка на строке {i}: {line}")
-                raise e
+        # Пропускаем пробелы
+        if is_whitespace(ch):
+            pos += 1
+            continue
         
-        text_size = self.position['.text']
-        print(f"ПРОХОД 1: text_size={text_size}")
+        # Комментарий до конца строки
+        if ch == ';':
+            break
         
-        # Проход 2
-        self.pass_num = 2
-        self.position['.text'] = 0
-        self.position['.data'] = 0
-        self.sections['.text'] = bytearray()
-        self.sections['.data'] = bytearray()
+        # Числа
+        if is_digit(ch) or (ch == '0' and pos + 1 < length and line[pos + 1] in 'xX'):
+            token, pos = read_number(line, pos, line_num, pos)
+            tokens.append(token)
+            continue
         
-        for i, line in enumerate(lines, 1):
-            try:
-                self.parse_line(line, i)
-            except Exception as e:
-                print(f"Ошибка на строке {i}: {line}")
-                raise e
+        # Строки в двойных кавычках
+        if ch == '"':
+            token, pos = read_string(line, pos, line_num, pos)
+            tokens.append(token)
+            continue
         
-        text_bytes = bytes(self.sections['.text'])
-        print(f"ПРОХОД 2: text_size={len(text_bytes)}")
+        # Символы в одинарных кавычках
+        if ch == "'":
+            token, pos = read_char(line, pos, line_num, pos)
+            tokens.append(token)
+            continue
         
-        # Определяем точку входа
-        entry = self.labels.get('_start')
-        if entry is None:
-            entry = self.labels.get('main')
-        if entry is None:
-            entry = 0
+        # Отдельные символы
+        if ch == ':':
+            tokens.append(Token(TOKEN_TYPES['COLON'], ':', line_num, pos))
+            pos += 1
+            continue
         
-        return text_bytes, entry
+        if ch == ',':
+            tokens.append(Token(TOKEN_TYPES['COMMA'], ',', line_num, pos))
+            pos += 1
+            continue
+        
+        if ch == '[':
+            tokens.append(Token(TOKEN_TYPES['LBRACKET'], '[', line_num, pos))
+            pos += 1
+            continue
+        
+        if ch == ']':
+            tokens.append(Token(TOKEN_TYPES['RBRACKET'], ']', line_num, pos))
+            pos += 1
+            continue
+        
+        if ch == '+':
+            tokens.append(Token(TOKEN_TYPES['PLUS'], '+', line_num, pos))
+            pos += 1
+            continue
+        
+        if ch == '-':
+            tokens.append(Token(TOKEN_TYPES['MINUS'], '-', line_num, pos))
+            pos += 1
+            continue
+        
+        # Слова (идентификаторы)
+        if is_alpha(ch) or ch == '.':
+            token, pos = read_word(line, pos, line_num, pos)
+            tokens.append(token)
+            continue
+        
+        # Любой другой символ - ошибка
+        raise ValueError(f"Неожиданный символ '{ch}' (код: {ord(ch)}) на строке {line_num}, позиция {pos}")
+    
+    return tokens
+
+
+def is_label_line(tokens):
+    """Проверяет, является ли строка определением метки"""
+    if not tokens:
+        return False
+    
+    # Формат: WORD COLON или LOCAL_LABEL COLON
+    if len(tokens) >= 2:
+        first_type = tokens[0].type
+        second_type = tokens[1].type
+        return (first_type in (TOKEN_TYPES['WORD'], TOKEN_TYPES['LOCAL_LABEL']) and 
+                second_type == TOKEN_TYPES['COLON'])
+    
+    return False
+
+
+def extract_label_name(tokens):
+    """Извлекает имя метки из токенов"""
+    if is_label_line(tokens):
+        return tokens[0].value, tokens[0].type
+    return None, None
+
+
+def tokenize_file(source_code):
+    """
+    Токенизирует весь файл
+    Возвращает список токенов, информацию о метках и локальных метках
+    """
+    lines = source_code.split('\n')
+    all_tokens = []
+    global_labels = {}      # имя -> (line, col)
+    local_labels = {}       # имя -> (line, col, parent_label)
+    current_parent = None   # текущая родительская метка для локальных
+    
+    for line_num, line in enumerate(lines, start=1):
+        try:
+            tokens = tokenize_line(line, line_num)
+            
+            if tokens:
+                # Проверяем на метку
+                if is_label_line(tokens):
+                    label_name, label_type = extract_label_name(tokens)
+                    
+                    if label_type == TOKEN_TYPES['LOCAL_LABEL']:
+                        # Локальная метка (с точкой)
+                        if current_parent:
+                            full_name = f"{current_parent}{label_name}"
+                            local_labels[full_name] = (line_num, tokens[0].col, current_parent)
+                            # Добавляем токен LOCAL_LABEL
+                            all_tokens.append(Token(TOKEN_TYPES['LOCAL_LABEL'], full_name, line_num, tokens[0].col))
+                        else:
+                            # Локальная метка без родителя — ошибка
+                            raise ValueError(f"Локальная метка {label_name} без родительской глобальной метки")
+                    else:
+                        # Глобальная метка
+                        global_labels[label_name] = (line_num, tokens[0].col)
+                        current_parent = label_name
+                        # Добавляем токен LABEL
+                        all_tokens.append(Token(TOKEN_TYPES['LABEL'], label_name, line_num, tokens[0].col))
+                    
+                    # Добавляем остальные токены (COLON и далее)
+                    for tok in tokens[1:]:
+                        all_tokens.append(tok)
+                else:
+                    # Не метка — просто добавляем все токены
+                    all_tokens.extend(tokens)
+                    # Сбрасываем current_parent? Нет, он сохраняется до следующей глобальной метки
+                    
+        except ValueError as e:
+            print(f"Ошибка токенизации: {e}", file=sys.stderr)
+            raise
+    
+    return all_tokens, global_labels, local_labels
 
 
 # ============================================================
-# Генерация ELF
+# Сохранение результата
 # ============================================================
 
-def create_elf(text: bytes, entry: int, output_file: str):
-    """Создаёт простой статический ELF"""
-    
-    text_vaddr = TEXT_VADDR
-    text_paddr = 0x2000  # Смещение в файле
-    
-    # ELF заголовок
-    elf = bytearray()
-    
-    # e_ident
-    elf.extend(b'\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00')
-    
-    # e_type (ET_EXEC = 2)
-    elf.extend(struct.pack('<H', 2))
-    # e_machine (EM_X86_64 = 0x3E)
-    elf.extend(struct.pack('<H', 0x3E))
-    # e_version (1)
-    elf.extend(struct.pack('<I', 1))
-    # e_entry
-    elf.extend(struct.pack('<Q', text_vaddr + entry))
-    # e_phoff
-    elf.extend(struct.pack('<Q', 64))
-    # e_shoff (0 = нет секций)
-    elf.extend(struct.pack('<Q', 0))
-    # e_flags
-    elf.extend(struct.pack('<I', 0))
-    # e_ehsize
-    elf.extend(struct.pack('<H', 64))
-    # e_phentsize
-    elf.extend(struct.pack('<H', 56))
-    # e_phnum (2 program headers)
-    elf.extend(struct.pack('<H', 2))
-    # e_shentsize
-    elf.extend(struct.pack('<H', 0))
-    # e_shnum
-    elf.extend(struct.pack('<H', 0))
-    # e_shstrndx
-    elf.extend(struct.pack('<H', 0))
-    
-    # Program header 1: .text (загружаемый, исполняемый)
-    # p_type (PT_LOAD = 1)
-    elf.extend(struct.pack('<I', 1))
-    # p_flags (PF_R | PF_X = 5)
-    elf.extend(struct.pack('<I', 5))
-    # p_offset
-    elf.extend(struct.pack('<Q', text_paddr))
-    # p_vaddr
-    elf.extend(struct.pack('<Q', text_vaddr))
-    # p_paddr
-    elf.extend(struct.pack('<Q', text_vaddr))
-    # p_filesz
-    elf.extend(struct.pack('<Q', len(text)))
-    # p_memsz
-    elf.extend(struct.pack('<Q', len(text)))
-    # p_align
-    elf.extend(struct.pack('<Q', PAGE_SIZE))
-    
-    # Program header 2: данные (загружаемые, читаемые/записываемые) - пустые
-    elf.extend(struct.pack('<I', 1))  # PT_LOAD
-    elf.extend(struct.pack('<I', 6))  # PF_R | PF_W
-    elf.extend(struct.pack('<Q', 0))  # offset
-    elf.extend(struct.pack('<Q', 0))  # vaddr
-    elf.extend(struct.pack('<Q', 0))  # paddr
-    elf.extend(struct.pack('<Q', 0))  # filesz
-    elf.extend(struct.pack('<Q', 0))  # memsz
-    elf.extend(struct.pack('<Q', PAGE_SIZE))  # align
-    
-    # Добавляем .text
-    while len(elf) < text_paddr:
-        elf.append(0)
-    elf.extend(text)
-    
-    with open(output_file, 'wb') as f:
-        f.write(elf)
-    
-    os.chmod(output_file, 0o755)
-    
-    print(f"ELF создан: {output_file}")
-    print(f"  .text: 0x{text_vaddr:x} - 0x{text_vaddr + len(text):x} ({len(text)} bytes)")
-    print(f"  entry: 0x{text_vaddr + entry:x}")
+def save_tokens_to_file(tokens, global_labels, local_labels, output_file):
+    """Сохраняет токены в текстовый файл"""
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write("=" * 80 + "\n")
+        f.write("РЕЗУЛЬТАТ ЛЕКСИЧЕСКОГО АНАЛИЗА\n")
+        f.write("=" * 80 + "\n\n")
+        
+        f.write(f"Глобальных меток: {len(global_labels)}\n")
+        if global_labels:
+            f.write("Глобальные метки:\n")
+            for name, (line, col) in sorted(global_labels.items()):
+                f.write(f"  {name}: строка {line}, колонка {col}\n")
+        f.write("\n")
+        
+        f.write(f"Локальных меток: {len(local_labels)}\n")
+        if local_labels:
+            f.write("Локальные метки:\n")
+            for name, (line, col, parent) in sorted(local_labels.items()):
+                f.write(f"  {name} (родитель: {parent}): строка {line}, колонка {col}\n")
+        f.write("\n")
+        
+        f.write("Токены:\n")
+        f.write("-" * 80 + "\n")
+        f.write(f"{'№':>6} | {'Тип':<18} | {'Значение':<30} | Строка | Кол\n")
+        f.write("-" * 80 + "\n")
+        
+        for idx, token in enumerate(tokens):
+            value_display = token.value.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+            f.write(f"{idx:>6} | {token.type:<18} | {value_display:<30} | {token.line:>6} | {token.col}\n")
+        
+        f.write("\n")
+        f.write("=" * 80 + "\n")
+        f.write("СТАТИСТИКА\n")
+        f.write("=" * 80 + "\n")
+        
+        type_counts = {}
+        for token in tokens:
+            type_counts[token.type] = type_counts.get(token.type, 0) + 1
+        
+        for token_type, count in sorted(type_counts.items()):
+            f.write(f"  {token_type:<18}: {count}\n")
+        
+        f.write(f"\nВсего токенов: {len(tokens)}\n")
 
 
 # ============================================================
@@ -403,40 +562,61 @@ def create_elf(text: bytes, entry: int, output_file: str):
 # ============================================================
 
 def main():
-    input_file = "output.asm"
-    output_file = "output.elf"
-    
     if len(sys.argv) > 1:
         input_file = sys.argv[1]
-    if len(sys.argv) > 2:
-        output_file = sys.argv[2]
+    else:
+        input_file = "output.asm"
     
-    if not Path(input_file).exists():
-        print(f"Ошибка: {input_file} не найден")
-        sys.exit(1)
+    base_name = input_file.rsplit('.', 1)[0] if '.' in input_file else input_file
+    output_detailed = f"{base_name}_tokens.txt"
     
-    print("=" * 50)
-    print("ELF ASSEMBLER (без NASM)")
-    print("=" * 50)
-    
-    with open(input_file, 'r', encoding='utf-8') as f:
-        asm_code = f.read()
-    
-    parser = AsmParser()
+    print("=" * 60)
+    print("ЛЕКСЕР ДЛЯ NASM-АССЕМБЛЕРА (ИСПРАВЛЕННАЯ ВЕРСИЯ)")
+    print("=" * 60)
+    print(f"Входной файл: {input_file}")
+    print(f"Выходной файл: {output_detailed}")
+    print()
     
     try:
-        text, entry = parser.assemble(asm_code)
-        create_elf(text, entry, output_file)
-        
-        print("\n" + "=" * 50)
-        print(f"ГОТОВО! Запустите: ./{output_file}")
-        print("=" * 50)
-        
-    except Exception as e:
-        print(f"\nОшибка сборки: {e}")
-        import traceback
-        traceback.print_exc()
+        with open(input_file, 'r', encoding='utf-8') as f:
+            source = f.read()
+    except FileNotFoundError:
+        print(f"ОШИБКА: Файл '{input_file}' не найден!", file=sys.stderr)
         sys.exit(1)
+    except Exception as e:
+        print(f"ОШИБКА при чтении файла: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    print("Выполняется лексический анализ...")
+    try:
+        tokens, global_labels, local_labels = tokenize_file(source)
+    except ValueError as e:
+        print(f"ОШИБКА при токенизации: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    print(f"Токенизация завершена успешно!")
+    print(f"Найдено токенов: {len(tokens)}")
+    print(f"Глобальных меток: {len(global_labels)}")
+    print(f"Локальных меток: {len(local_labels)}")
+    
+    if global_labels:
+        print("\nГлобальные метки:")
+        for name in sorted(global_labels.keys()):
+            print(f"  - {name}")
+    
+    if local_labels:
+        print("\nЛокальные метки:")
+        for name in sorted(local_labels.keys()):
+            print(f"  - {name}")
+    
+    print()
+    
+    save_tokens_to_file(tokens, global_labels, local_labels, output_detailed)
+    print(f"✓ Результат сохранён в {output_detailed}")
+    print()
+    print("=" * 60)
+    print("ГОТОВО!")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
