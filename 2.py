@@ -470,7 +470,7 @@ def _is_unary_context(tokens, index):
                    'OP_DIV', 'OP_MOD', 'OP_AMP', 'OP_BIT_OR', 'OP_BIT_XOR',
                    'OP_LT', 'OP_GT', 'OP_LE', 'OP_GE', 'OP_EQ', 'OP_NE',
                    'OP_AND', 'OP_OR', 'OP_LSHIFT', 'OP_RSHIFT',
-                   'PUNC_SEMICOLON'}  # Добавили точку с запятой
+                   'PUNC_SEMICOLON', 'PUNC_RPAREN', 'PUNC_RBRACE', 'PUNC_LBRACE'}  
     
     return prev_type in unary_after
 
@@ -536,9 +536,24 @@ def _classify_star(tokens, index, token_type, token_value, context):
     return 'OP_MUL'
 
 
-
+from ext_ast import *
 def _classify_amp(tokens, index):
-    """Определить тип амперсанда"""
+    
+    # Проверка на приведение типа: ( type ) &
+    if index >= 2 and tokens[index-1][0] == 'PUNC_RPAREN':
+        i = index - 2
+        # Пропускаем модификаторы
+        while i >= 0 and tokens[i][0] in MODIFIER_TOKENS:
+            i -= 1
+        # Проверяем, что перед закрывающей скобкой был тип и открывающая скобка
+        if i >= 1 and tokens[i-1][0] == 'PUNC_LPAREN' and tokens[i][0] in TYPE_TOKENS:
+            return 'OP_ADDRESS'
+    # Если перед & идентификатор, число, закрывающая скобка или скобка массива – бинарный
+    if index > 0:
+        prev_type = tokens[index-1][0]
+        if prev_type in ('IDENTIFIER', 'NUMBER', 'PUNC_RPAREN', 'PUNC_RBRACKET'):
+            return 'OP_BIT_AND'
+    # Унарный контекст (после операторов, запятых, присваиваний и т.д.)
     if _is_unary_context(tokens, index):
         return 'OP_ADDRESS'
     return 'OP_BIT_AND'
