@@ -174,6 +174,8 @@ COMPOUND_ASSIGN_MAP = {
 UNARY_OP_MAP = {
     'OP_PLUS': 'UnaryPlus',
     'OP_MINUS': 'UnaryMinus',
+    'OP_UNARY_PLUS': 'UnaryPlus',    # ← добавить
+    'OP_UNARY_MINUS': 'UnaryMinus',  # ← добавить
     'OP_NOT': 'Not',
     'OP_BIT_NOT': 'BitNot',
     'OP_DEREF': 'Deref',
