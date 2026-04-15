@@ -517,10 +517,15 @@ def parse_expression(state: ParserState, min_prec: int = 0) -> dict:
     
     """Разбор выражения (алгоритм Pratt)"""
     left = parse_primary(state)
+
     
     while True:
         token_type = peek_type(state)
         debug.log(f"Обработка оператора: {token_type}")
+
+        # Отладочный вывод для &
+        if token_type == 'OP_BIT_AND':
+            print(f"DEBUG: found OP_BIT_AND, in BINARY_OP_MAP? {token_type in BINARY_OP_MAP}")
         
         # Присваивание
         if token_type == 'OP_ASSIGN' or token_type in COMPOUND_ASSIGN_MAP:
