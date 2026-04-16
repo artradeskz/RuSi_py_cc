@@ -1,164 +1,290 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Скрипт 1: Сшивка файлов lib.c и test.c с удалением комментариев
-Простая реализация без лишних зависимостей
+Сшивка C-файлов с подстановкой #include и удалением комментариев.
+
+Использование:
+    python merge.py [входной_файл [выходной_файл]]
+
+- Если входной файл не указан, используется "test.c".
+- Если выходной файл не указан, используется "merged.c".
+- Обрабатывает директивы:
+    #include "file.c"
+    #include file.c
+    #вкл "file.c"
+    #вкл file.c
+- Подставляет содержимое указанных файлов (только один уровень, без рекурсии).
+- Удаляет все комментарии в стиле C (/* ... */ и // ...).
+- Сохраняет кодировку UTF-8 (кириллица работает).
 """
 
 import sys
 from pathlib import Path
 
 
-def remove_comments(content: str) -> str:
+# ----------------------------------------------------------------------
+# Удаление комментариев (простой конечный автомат)
+# ----------------------------------------------------------------------
+def удалить_комментарии(содержимое: str) -> str:
     """
-    Удаляет C-комментарии:
-    - Блочные /* ... */
-    - Строчные // ...
-    
-    Сохраняет строковые литералы и символьные константы
+    Удаляет блочные /* ... */ и строчные // комментарии,
+    не затрагивая строки "..." и символы '...'.
     """
-    result = []
+    СОСТ_КОД = 0
+    СОСТ_СТРОКА = 1
+    СОСТ_СИМВОЛ = 2
+    СОСТ_БЛОЧНЫЙ = 3
+    СОСТ_СТРОЧНЫЙ = 4
+
+    состояние = СОСТ_КОД
+    результат = []
     i = 0
-    length = len(content)
-    
-    while i < length:
-        # Проверка на начало строкового литерала
-        if content[i] == '"':
-            result.append('"')
-            i += 1
-            while i < length and content[i] != '"':
-                # Пропускаем экранированные кавычки
-                if content[i] == '\\' and i + 1 < length:
-                    result.append(content[i])
-                    i += 1
-                    result.append(content[i])
-                    i += 1
-                else:
-                    result.append(content[i])
-                    i += 1
-            if i < length:
-                result.append('"')
-                i += 1
-            continue
-        
-        # Проверка на начало символьной константы
-        if content[i] == "'":
-            result.append("'")
-            i += 1
-            while i < length and content[i] != "'":
-                if content[i] == '\\' and i + 1 < length:
-                    result.append(content[i])
-                    i += 1
-                    result.append(content[i])
-                    i += 1
-                else:
-                    result.append(content[i])
-                    i += 1
-            if i < length:
-                result.append("'")
-                i += 1
-            continue
-        
-        # Блочный комментарий /* */
-        if content[i] == '/' and i + 1 < length and content[i + 1] == '*':
-            i += 2
-            while i + 1 < length:
-                if content[i] == '*' and content[i + 1] == '/':
+    n = len(содержимое)
+
+    while i < n:
+        ch = содержимое[i]
+
+        if состояние == СОСТ_КОД:
+            if ch == '"':
+                состояние = СОСТ_СТРОКА
+                результат.append(ch)
+            elif ch == "'":
+                состояние = СОСТ_СИМВОЛ
+                результат.append(ch)
+            elif ch == '/' and i + 1 < n:
+                if содержимое[i + 1] == '*':
+                    состояние = СОСТ_БЛОЧНЫЙ
                     i += 2
-                    break
+                    continue
+                elif содержимое[i + 1] == '/':
+                    состояние = СОСТ_СТРОЧНЫЙ
+                    i += 2
+                    continue
+                else:
+                    результат.append(ch)
+            else:
+                результат.append(ch)
+
+        elif состояние == СОСТ_СТРОКА:
+            результат.append(ch)
+            if ch == '\\' and i + 1 < n:
+                # Экранированный символ – копируем следующий как есть
                 i += 1
-            continue
-        
-        # Строчный комментарий //
-        if content[i] == '/' and i + 1 < length and content[i + 1] == '/':
-            i += 2
-            while i < length and content[i] != '\n':
+                результат.append(содержимое[i])
+            elif ch == '"':
+                состояние = СОСТ_КОД
+
+        elif состояние == СОСТ_СИМВОЛ:
+            результат.append(ch)
+            if ch == '\\' and i + 1 < n:
                 i += 1
-            continue
-        
-        # Обычный символ
-        result.append(content[i])
+                результат.append(содержимое[i])
+            elif ch == "'":
+                состояние = СОСТ_КОД
+
+        elif состояние == СОСТ_БЛОЧНЫЙ:
+            if ch == '*' and i + 1 < n and содержимое[i + 1] == '/':
+                состояние = СОСТ_КОД
+                i += 2
+                continue
+
+        elif состояние == СОСТ_СТРОЧНЫЙ:
+            if ch == '\n':
+                состояние = СОСТ_КОД
+                результат.append('\n')  # сохраняем перенос строки
+
         i += 1
-    
-    return ''.join(result)
+
+    return ''.join(результат)
 
 
-def merge_files(lib_path: str, test_path: str, output_path: str = "merged.c") -> str:
+# ----------------------------------------------------------------------
+# Проверка, является ли строка директивой #include / #вкл
+# ----------------------------------------------------------------------
+def разобрать_директиву(строка: str):
     """
-    Сшивает два файла в один, удаляя комментарии
+    Проверяет, является ли строка директивой #include или #вкл.
+    Возвращает имя файла или None.
     
-    Args:
-        lib_path: путь к lib.c
-        test_path: путь к test.c  
-        output_path: путь для выходного файла
-    
-    Returns:
-        Содержимое сшитого файла
+    Поддерживаемые форматы:
+        #include "file.c"
+        #include file.c
+        #вкл "file.c"
+        #вкл file.c
     """
-    # Читаем файлы
-    with open(lib_path, 'r', encoding='utf-8') as f:
-        lib_content = f.read()
+    # Убираем начальные пробелы
+    s = строка.lstrip()
     
-    with open(test_path, 'r', encoding='utf-8') as f:
-        test_content = f.read()
+    # Проверяем, что начинается с #
+    if not s.startswith('#'):
+        return None
     
+    # Убираем # и пробелы после неё
+    s = s[1:].lstrip()
+    
+    # Проверяем ключевое слово include или вкл (без учёта регистра)
+    ключевые_слова = ['include', 'вкл']
+    ключ = None
+    for kw in ключевые_слова:
+        if len(s) >= len(kw):
+            # Сравниваем без учёта регистра
+            начало = s[:len(kw)].lower()
+            if начало == kw:
+                ключ = kw
+                break
+    
+    if ключ is None:
+        return None
+    
+    # Убираем ключевое слово и пробелы после него
+    s = s[len(ключ):].lstrip()
+    
+    # Теперь должно быть имя файла
+    if not s:
+        return None
+    
+    # Проверяем, в кавычках или нет
+    if s[0] == '"':
+        # Ищем закрывающую кавычку
+        конец = 1
+        while конец < len(s) and s[конец] != '"':
+            конец += 1
+        if конец < len(s) and s[конец] == '"':
+            return s[1:конец]
+        else:
+            return None
+    else:
+        # Без кавычек — берём до пробела или конца строки
+        конец = 0
+        while конец < len(s) and s[конец] not in ' \t\r\n':
+            конец += 1
+        if конец > 0:
+            return s[:конец]
+    
+    return None
+
+
+# ----------------------------------------------------------------------
+# Подстановка #include
+# ----------------------------------------------------------------------
+def подставить_включения(базовый_путь: Path, содержимое: str, подробно: bool = True) -> str:
+    """
+    Находит строки вида #include "file.c" или #вкл file.c
+    и заменяет их содержимым файла (относительно базового_пути).
+    Рекурсия не поддерживается.
+    """
+    строки = содержимое.splitlines(keepends=True)
+    результат = []
+    включено_файлов = 0
+
+    for номер_строки, строка in enumerate(строки, 1):
+        имя_файла = разобрать_директиву(строка)
+        
+        if имя_файла:
+            путь_к_файлу = базовый_путь / имя_файла
+            
+            if подробно:
+                print(f"  [строка {номер_строки}] Найдена директива: {имя_файла}")
+            
+            if путь_к_файлу.exists():
+                try:
+                    with open(путь_к_файлу, 'r', encoding='utf-8') as f:
+                        включённое_содержимое = f.read()
+                    
+                    if подробно:
+                        кол_строк = len(включённое_содержимое.splitlines())
+                        print(f"    -> Включаю {путь_к_файлу} ({кол_строк} строк)")
+                    
+                    результат.append(включённое_содержимое)
+                    включено_файлов += 1
+                    
+                except Exception as e:
+                    print(f"    ОШИБКА: не могу прочитать {путь_к_файлу}: {e}", file=sys.stderr)
+                    # Оставляем директиву как есть в случае ошибки
+                    результат.append(строка)
+            else:
+                print(f"    ПРЕДУПРЕЖДЕНИЕ: {путь_к_файлу} не найден, директива удалена", file=sys.stderr)
+                # Директиву НЕ добавляем (удаляем)
+        else:
+            # Обычная строка
+            результат.append(строка)
+
+    if подробно and включено_файлов > 0:
+        print(f"  Всего включено файлов: {включено_файлов}")
+    
+    return ''.join(результат)
+
+
+# ----------------------------------------------------------------------
+# Основная программа
+# ----------------------------------------------------------------------
+def главная():
+    print("=" * 60)
+    print("СШИВКА C-ФАЙЛОВ с поддержкой #include")
+    print("=" * 60)
+    print()
+    
+    # Аргументы: входной файл (по умолч. test.c), выходной файл (по умолч. merged.c)
+    аргументы = sys.argv[1:]
+    входной_файл = "test.c"
+    выходной_файл = "merged.c"
+
+    if len(аргументы) >= 1:
+        входной_файл = аргументы[0]
+    if len(аргументы) >= 2:
+        выходной_файл = аргументы[1]
+
+    print(f"Входной файл:  {входной_файл}")
+    print(f"Выходной файл: {выходной_файл}")
+    print()
+
+    входной_путь = Path(входной_файл)
+    if not входной_путь.exists():
+        print(f"ОШИБКА: файл '{входной_путь}' не найден", file=sys.stderr)
+        sys.exit(1)
+
+    # Читаем основной файл
+    print(f"Чтение {входной_путь}...")
+    with open(входной_путь, 'r', encoding='utf-8') as f:
+        основное_содержимое = f.read()
+    
+    кол_строк = len(основное_содержимое.splitlines())
+    print(f"  Прочитано {кол_строк} строк, {len(основное_содержимое)} символов")
+    print()
+
+    # Подставляем #include
+    print("Обработка директив #include / #вкл...")
+    базовый_путь = входной_путь.parent.resolve()
+    расширенное = подставить_включения(базовый_путь, основное_содержимое, подробно=True)
+    print()
+
     # Удаляем комментарии
-    lib_clean = remove_comments(lib_content)
-    test_clean = remove_comments(test_content)
+    print("Удаление комментариев...")
+    очищенное = удалить_комментарии(расширенное)
     
-    # Удаляем пустые строки в начале и конце
-    lib_clean = lib_clean.strip()
-    test_clean = test_clean.strip()
+    # Убираем пустые строки в начале/конце
+    очищенное = очищенное.strip()
     
-    # Собираем результат (без комментариев и разделителей)
-    merged = lib_clean + "\n\n" + test_clean
-    
-    # Сохраняем
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(merged)
-    
-    # Статистика
-    original_size = len(lib_content) + len(test_content)
-    cleaned_size = len(lib_clean) + len(test_clean)
-    
-    print("=" * 50)
-    print("MERGE FILES WITH COMMENT REMOVAL")
-    print("=" * 50)
+    print(f"  До очистки:     {len(расширенное)} символов")
+    print(f"  После очистки:  {len(очищенное)} символов")
+    удалено = len(расширенное) - len(очищенное)
+    процент = 100 * удалено / len(расширенное) if len(расширенное) > 0 else 0
+    print(f"  Удалено:        {удалено} символов ({процент:.1f}%)")
     print()
-    print("Source files:")
-    print(f"  lib.c:  {len(lib_content):,} chars")
-    print(f"  test.c: {len(test_content):,} chars")
-    print(f"  Total:  {original_size:,} chars")
-    print()
-    print("After comment removal:")
-    print(f"  Total:  {cleaned_size:,} chars")
-    print(f"  Ratio:  {(1 - cleaned_size/original_size)*100:.1f}% reduction")
-    print()
-    print(f"Merged file saved: {output_path}")
-    
-    return merged
 
-
-def main():
-    lib_path = "lib.c"
-    test_path = "test.c"
+    # Сохраняем результат
+    print(f"Запись в {выходной_файл}...")
+    with open(выходной_файл, 'w', encoding='utf-8') as f:
+        f.write(очищенное)
     
-    # Check if files exist
-    if not Path(lib_path).exists():
-        print(f"Error: {lib_path} not found")
-        sys.exit(1)
-    
-    if not Path(test_path).exists():
-        print(f"Error: {test_path} not found")
-        sys.exit(1)
-    
-    merge_files(lib_path, test_path, "merged.c")
-    
+    размер_результата = Path(выходной_файл).stat().st_size
+    print(f"  Записано {размер_результата} байт")
     print()
-    print("=" * 50)
-    print("сшито")
-    print("=" * 50)
+    
+    print("=" * 60)
+    print("ГОТОВО!")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
-    main()
+    главная()
